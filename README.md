@@ -15,6 +15,7 @@ Instead of a traditional monolithic script, this project implements a highly sca
 
 - **Modular Architecture**: Built a reusable `vps` module, enabling instantaneous provisioning of identical environments (`dev`, `staging`, `prod`) while adhering to the DRY (Don't Repeat Yourself) principle.
 - **Automated Provisioning (Cloud-Init)**: Utilized Bash scripting injected via `user_data` to automatically install Docker, Portainer, and Nginx Proxy Manager on boot without human intervention.
+- **Resilient Container Networking**: Implemented a custom Docker bridge network (`proxy-network`) enabling automatic Internal DNS resolution, ensuring seamless reverse proxying regardless of dynamic IP assignments.
 - **Zero-Trust Security & Hardening**:
   - Direct public access to administrative dashboards (Portainer & NPM Admin) is **blocked**.
   - Internal admin services are bound strictly to `127.0.0.1`.
@@ -26,36 +27,9 @@ Instead of a traditional monolithic script, this project implements a highly sca
 
 ## 🏗️ Architecture Visualization
 
-*(This is an auto-generated Mermaid diagram. For your actual portfolio, see the "Recommendation" section below!)*
+[![Project Architecture](https://app.eraser.io/workspace/wkt4PvQbUT8Yd0HsOsSm/preview?elements=8Yh63-Fw-8WcK-a2x3U8qQ&type=embed)](https://app.eraser.io/workspace/wkt4PvQbUT8Yd0HsOsSm?origin=share)
 
-```mermaid
-flowchart TD
-    User([🌐 Internet Users])
-    Admin([🔒 System Administrator])
-
-    subgraph "DigitalOcean Cloud"
-        FW[🛡️ Cloud Firewall]
-        
-        subgraph "Droplet (fadil-learning-vps)"
-            Docker[(Docker Engine)]
-            
-            NPM[Nginx Proxy Manager\n(Reverse Proxy)]
-            Portainer[Portainer CE\n(Container UI)]
-            
-            Docker --- NPM
-            Docker --- Portainer
-        end
-    end
-
-    User -- "HTTP/HTTPS (80, 443)" --> FW
-    FW -- "Allows Web Traffic" --> NPM
-    
-    Admin -- "SSH (22)" --> FW
-    FW -- "Encrypted Connection" --> Droplet
-    
-    Admin -. "SSH Tunnel (Localhost:9000)" .-> Portainer
-    Admin -. "SSH Tunnel (Localhost:81)" .-> NPM
-```
+> **Note:** Click the image above to view the interactive diagram and source code on Eraser.io.
 
 ---
 

@@ -19,11 +19,15 @@ apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
 systemctl enable --now docker
 
+# Buat Custom Network untuk DNS Resolution internal Docker
+docker network create proxy-network
+
 # Install Portainer
 docker volume create portainer_data
 docker run -d \
   -p 127.0.0.1:9000:9000 \
   --name portainer \
+  --network proxy-network \
   --restart=always \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v portainer_data:/data \
@@ -38,6 +42,7 @@ docker run -d \
   -p 443:443 \
   -p 127.0.0.1:81:81 \
   --name nginx-proxy-manager \
+  --network proxy-network \
   --restart=always \
   -v npm_data:/data \
   -v npm_letsencrypt:/etc/letsencrypt \
