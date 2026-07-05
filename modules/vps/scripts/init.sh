@@ -28,3 +28,17 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v portainer_data:/data \
   portainer/portainer-ce:latest
+
+# Install Nginx Proxy Manager
+docker volume create npm_data
+docker volume create npm_letsencrypt
+
+docker run -d \
+  -p 80:80 \
+  -p 443:443 \
+  -p 127.0.0.1:81:81 \
+  --name nginx-proxy-manager \
+  --restart=always \
+  -v npm_data:/data \
+  -v npm_letsencrypt:/etc/letsencrypt \
+  jc21/nginx-proxy-manager:latest

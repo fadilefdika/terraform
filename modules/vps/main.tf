@@ -4,7 +4,7 @@ data "digitalocean_ssh_key" "main" {
 
 resource "digitalocean_droplet" "main" {
   image      = "ubuntu-22-04-x64"
-  name       = "fadil-learning-vps"
+  name       = var.droplet_name
   region     = var.region
   size       = var.droplet_size
   ssh_keys   = [data.digitalocean_ssh_key.main.id]
@@ -19,7 +19,7 @@ resource "digitalocean_droplet" "main" {
 }
 
 resource "digitalocean_firewall" "main" {
-  name        = "fadil-server-firewall"
+  name        = "${var.droplet_name}-firewall"
   droplet_ids = [digitalocean_droplet.main.id]
 
   inbound_rule {

@@ -1,11 +1,10 @@
-variable "do_token" {
-  description = "DigitalOcean API Token"
-  type        = string
-  sensitive   = true
-}
-
 variable "ssh_key_name" {
   description = "Nama SSH key yang sudah diupload ke DO"
+  type        = string
+}
+
+variable "droplet_name" {
+  description = "Nama dari droplet VPS"
   type        = string
 }
 
