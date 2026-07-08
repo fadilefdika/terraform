@@ -25,3 +25,5 @@ override.tf.json
 terraform.rc
 
 AGENTS.md
+
+planning.md
