@@ -3,6 +3,13 @@
   hosts: hub
   become: yes # Bertindak sebagai root (sudo)
 
+  vars:
+    portainer_port: 9000
+    npm_port: 8181
+    prometheus_port: 9090
+    grafana_port: 3000
+    monitoring_dir: /opt/monitoring
+
   tasks:
     - name: 1. Update apt cache & Install dependencies dasar
       apt:
@@ -30,6 +37,7 @@
           - docker-ce-cli
           - containerd.io
           - docker-compose-plugin
+          - python3-docker # Syarat wajib untuk memakai modul Ansible Docker
         state: present
 
     - name: 5. Pastikan Docker otomatis menyala saat server restart
@@ -45,7 +53,7 @@
 
     - name: 7. Jalankan Portainer Container
       command: >
-        docker run -d -p 127.0.0.1:9000:9000 --name portainer
+        docker run -d -p 127.0.0.1:{{ portainer_port }}:9000 --name portainer
         --network proxy-network --restart=always
         -v /var/run/docker.sock:/var/run/docker.sock
         -v portainer_data:/data portainer/portainer-ce:latest
@@ -55,10 +63,67 @@
       command: docker rm -f nginx-proxy-manager
       ignore_errors: yes
 
-    - name: 8b. Jalankan Nginx Proxy Manager Container (Port 8181)
+    - name: 8b. Jalankan Nginx Proxy Manager Container (Port {{ npm_port }})
       command: >
-        docker run -d -p 80:80 -p 443:443 -p 127.0.0.1:8181:81
+        docker run -d -p 80:80 -p 443:443 -p 127.0.0.1:{{ npm_port }}:81
         --name nginx-proxy-manager --network proxy-network --restart=always
         -v npm_data:/data -v npm_letsencrypt:/etc/letsencrypt
         jc21/nginx-proxy-manager:latest
       ignore_errors: yes
+
+    - name: 9. Buat Folder Monitoring
+      file:
+        path: '{{ monitoring_dir }}'
+        state: directory
+
+    - name: 10. Injeksi file konfigurasi prometheus.yml
+      copy:
+        dest: '{{ monitoring_dir }}/prometheus.yml'
+        content: |
+          global:
+            scrape_interval: 10s
+          scrape_configs:
+            - job_name: 'tencent_hub'
+              static_configs:
+                - targets: ['node-exporter:9100']
+      notify: Restart Prometheus
+
+    - name: 11. Jalankan Node Exporter (Modul Elegan)
+      community.docker.docker_container:
+        name: node-exporter
+        image: prom/node-exporter:latest
+        state: started
+        restart_policy: always
+        networks:
+          - name: proxy-network
+
+    - name: 12. Jalankan Prometheus (Modul Elegan)
+      community.docker.docker_container:
+        name: prometheus
+        image: prom/prometheus:latest
+        state: started
+        restart_policy: always
+        networks:
+          - name: proxy-network
+        published_ports:
+          - '127.0.0.1:{{ prometheus_port }}:9090'
+        volumes:
+          - '{{ monitoring_dir }}/prometheus.yml:/etc/prometheus/prometheus.yml'
+
+    - name: 13. Jalankan Grafana (Modul Elegan)
+      community.docker.docker_container:
+        name: grafana
+        image: grafana/grafana:latest
+        state: started
+        restart_policy: always
+        networks:
+          - name: proxy-network
+        published_ports:
+          - '127.0.0.1:{{ grafana_port }}:3000'
+
+  handlers:
+    - name: Restart Prometheus
+      community.docker.docker_container:
+        name: prometheus
+        state: started
+        restart: yes
