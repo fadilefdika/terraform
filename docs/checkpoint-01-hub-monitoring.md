@@ -32,5 +32,14 @@ Ansible adalah alat *Configuration Management* (Infrastructure as Code).
 - **Localhost Binding:** Semua port admin dikunci ke `127.0.0.1` di dalam konfigurasi Docker.
 - **SSH Tunneling:** Satu-satunya cara untuk membukanya adalah dengan membuat "Terowongan Gaib" menggunakan fitur Port Forwarding di Termius. Cara ini menjadikan keamanan setingkat Enterprise (100% kebal serangan publik).
 
+## 6. Tritunggal Ansible (Variables, Modules, Handlers)
+- **Variables (`vars:`):** Memisahkan konfigurasi (seperti nomor *port*) ke bagian paling atas *playbook* agar mudah diganti. Pemanggilannya menggunakan *Jinja2 Templating* (`{{ nama_variabel }}`).
+- **Modul Resmi (`docker_container`):** Cara elegan yang bersifat Deklaratif (Stateful). Ansible tidak lagi mengetik perintah `docker run` secara buta, melainkan mewawancarai *Docker Engine* lewat API. Jika kontainer sudah ada dan konfigurasinya sama, ia akan diam (`ok`). Jika beda, ia akan menghancurkan yang lama dan membuat yang baru (`changed`). Tidak akan pernah ada pesan *Error Conflict*!
+- **Handlers:** Kecerdasan kausalitas (*Sebab-Akibat*). Jika file konfigurasi (seperti `prometheus.yml`) berubah, Ansible akan memanggil *Handler* untuk me-*restart* kontainer secara otomatis di akhir proses. Jika file tidak berubah, *restart* tidak akan dieksekusi.
+
+## 7. Wawancara Teknis: Prometheus & Zero-Trust
+- **HTTP Pull Mechanism:** Prometheus mengambil data dengan cara "menyedot" (*Scrape/Pull*) secara proaktif ke *endpoint* HTTP `/metrics` milik targetnya (seperti Node Exporter) sesuai jadwal `scrape_interval`.
+- **Keamanan Jaringan Internal:** *Endpoint* metrik ini sangat rahasia. Mengapa *browser* publik ditolak (*Connection Refused*) saat mengakses `http://IP:9100/metrics`? Karena kita **tidak mengekspos** (*publish*) port 9100 tersebut ke *host*. Node Exporter dan Prometheus berada di satu ruang isolasi (*Docker Bridge Network*), sehingga hanya Prometheus yang bisa mengakses metrik tersebut dari dalam melalui *Internal DNS*.
+
 ---
-*Misi Selanjutnya (Fase 3): Menggabungkan DO Droplet ke dalam ekosistem pemantauan ini.*
+*Misi Selanjutnya (Fase 3): Melahirkan Sandbox DO dan menggabungkannya ke ekosistem pemantauan ini.*

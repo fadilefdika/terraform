@@ -27,3 +27,6 @@ terraform.rc
 AGENTS.md
 
 planning.md
+
+# Ansible Vault
+.vault_pass.txt

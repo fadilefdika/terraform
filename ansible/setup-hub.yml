@@ -3,6 +3,9 @@
   hosts: hub
   become: yes # Bertindak sebagai root (sudo)
 
+  vars_files:
+    - secrets.yml # File rahasia yang dienkripsi Ansible Vault
+
   vars:
     portainer_port: 9000
     npm_port: 8181
@@ -120,6 +123,8 @@
           - name: proxy-network
         published_ports:
           - '127.0.0.1:{{ grafana_port }}:3000'
+        env:
+          GF_SECURITY_ADMIN_PASSWORD: "{{ grafana_admin_password }}"
 
   handlers:
     - name: Restart Prometheus
