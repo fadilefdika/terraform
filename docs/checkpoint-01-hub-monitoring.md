@@ -1,45 +1,99 @@
 # Checkpoint 01: SRE Hub & Monitoring Automation
 
-**Tanggal:** 8 Juli 2026
-**Fase:** Penyelesaian Fase 1 (Ansible & Tencent Hub)
-
-File ini adalah catatan refleksi dan rangkuman materi SRE yang telah berhasil dipraktikkan. Gunakan catatan ini sebagai bahan *review* (*study guide*) sebelum melanjutkan ke materi yang lebih kompleks.
-
-## 1. Arsitektur Hybrid Cloud (Tencent + DigitalOcean)
-- **Tencent (Hub):** Berfungsi sebagai "Gerbang Utama" (Gateway) 24/7. Mengelola *routing* (Nginx) dan pemantauan (Prometheus/Grafana). Server ini menampung aplikasi administratif.
-- **DigitalOcean (Sandbox):** Berfungsi sebagai "Pabrik Aplikasi". Server ini bersifat *ephemeral* (bisa dihancurkan dan dibuat kapan saja menggunakan Terraform) demi menghemat biaya (FinOps).
-
-## 2. Pemahaman Konsep Ansible
-Ansible adalah alat *Configuration Management* (Infrastructure as Code).
-- **Idempotency:** Fitur ajaib Ansible. Jika kita menyuruh Ansible menginstal Docker tapi Docker sudah ada, Ansible tidak akan *error* atau menginstal ulang, ia hanya membalas `ok` (Skip).
-- **Modul `command` vs Modul Spesifik:** 
-  - Menggunakan `command: docker run` sangat rawan *error* jika kontainer sudah ada (sehingga kita akali dengan `ignore_errors: yes`). Ini disebut *Anti-Pattern*.
-  - Praktik *SRE Sejati* menyarankan penggunaan modul resmi seperti `community.docker.docker_container` agar Ansible bisa mendeteksi perubahan volume dan menghancurkan kontainer lama secara cerdas (tanpa *error* merah).
-- **Modul `file` & `copy`:** Membuktikan bahwa Ansible bisa membuat folder (`/opt/monitoring`) dan menyuntikkan file teks langsung ke dalam server tanpa campur tangan manusia (tanpa editor `nano`).
-
-## 3. Pemahaman Konsep Docker
-- **Immutable:** Kontainer yang sudah menyala tidak bisa diubah "jeroannya". Jika kita mengubah lokasi file *volume*, kita wajib menghancurkan kontainer lama (`docker rm -f`) dan membuat kontainer baru agar ia bisa menyedot data dari jalur yang baru.
-- **Volume Mounting:** Konsep "menyuntikkan" atau "memfotokopi" file dari server fisik (misal `/opt/monitoring/prometheus.yml`) ke dalam perut kontainer Docker (`/etc/prometheus/...`).
-- **Internal DNS (Network):** Karena semua kontainer berada di satu jaringan `proxy-network`, Grafana bisa memanggil Prometheus cukup dengan memanggil namanya (`http://prometheus:9090`), tanpa perlu tahu IP-nya.
-
-## 4. Pemahaman Konsep Grafana & Prometheus
-- **Prometheus (Backend):** Bertindak sebagai "Pengepul Data" atau *Scraper*. Ia butuh file teks `prometheus.yml` untuk mengetahui ke mana ia harus mengambil data metrik (contoh: menyedot metrik dari Node Exporter).
-- **Node Exporter:** Sebuah "Agen" atau detektif kecil yang dipasang di setiap server (Tencent & DO) untuk mencatat seberapa lelah CPU dan seberapa penuh RAM server tersebut.
-- **Grafana (Frontend):** Bertindak sebagai "Layar TV". Grafana itu bodoh jika tidak disambungkan ke *Data Source* (Prometheus). Semua pengaturannya (seperti *import dashboard* ID 1860) bisa dilakukan sepenuhnya lewat *User Interface* (UI) berbasis klik, sehingga tidak butuh file konfigurasi `.yml` di server.
-
-## 5. Konsep Zero-Trust Security & Tunneling
-- **Jangan Percaya Internet:** Halaman administratif (Portainer, Nginx Admin, Grafana) TIDAK BOLEH diekspos ke publik dengan domain (`portainer.domain.com`) untuk menghindari serangan *brute-force* dari *bot hacker*.
-- **Localhost Binding:** Semua port admin dikunci ke `127.0.0.1` di dalam konfigurasi Docker.
-- **SSH Tunneling:** Satu-satunya cara untuk membukanya adalah dengan membuat "Terowongan Gaib" menggunakan fitur Port Forwarding di Termius. Cara ini menjadikan keamanan setingkat Enterprise (100% kebal serangan publik).
-
-## 6. Tritunggal Ansible (Variables, Modules, Handlers)
-- **Variables (`vars:`):** Memisahkan konfigurasi (seperti nomor *port*) ke bagian paling atas *playbook* agar mudah diganti. Pemanggilannya menggunakan *Jinja2 Templating* (`{{ nama_variabel }}`).
-- **Modul Resmi (`docker_container`):** Cara elegan yang bersifat Deklaratif (Stateful). Ansible tidak lagi mengetik perintah `docker run` secara buta, melainkan mewawancarai *Docker Engine* lewat API. Jika kontainer sudah ada dan konfigurasinya sama, ia akan diam (`ok`). Jika beda, ia akan menghancurkan yang lama dan membuat yang baru (`changed`). Tidak akan pernah ada pesan *Error Conflict*!
-- **Handlers:** Kecerdasan kausalitas (*Sebab-Akibat*). Jika file konfigurasi (seperti `prometheus.yml`) berubah, Ansible akan memanggil *Handler* untuk me-*restart* kontainer secara otomatis di akhir proses. Jika file tidak berubah, *restart* tidak akan dieksekusi.
-
-## 7. Wawancara Teknis: Prometheus & Zero-Trust
-- **HTTP Pull Mechanism:** Prometheus mengambil data dengan cara "menyedot" (*Scrape/Pull*) secara proaktif ke *endpoint* HTTP `/metrics` milik targetnya (seperti Node Exporter) sesuai jadwal `scrape_interval`.
-- **Keamanan Jaringan Internal:** *Endpoint* metrik ini sangat rahasia. Mengapa *browser* publik ditolak (*Connection Refused*) saat mengakses `http://IP:9100/metrics`? Karena kita **tidak mengekspos** (*publish*) port 9100 tersebut ke *host*. Node Exporter dan Prometheus berada di satu ruang isolasi (*Docker Bridge Network*), sehingga hanya Prometheus yang bisa mengakses metrik tersebut dari dalam melalui *Internal DNS*.
+**Tanggal:** 8 Juli 2026  
+**Fase:** Penyelesaian Fase 1 (Ansible & Tencent Hub)  
+**Status:** ✅ Complete
 
 ---
-*Misi Selanjutnya (Fase 3): Melahirkan Sandbox DO dan menggabungkannya ke ekosistem pemantauan ini.*
+
+## Apa yang Dibangun
+
+Server Tencent Cloud berhasil dikonfigurasi penuh sebagai Hub permanen menggunakan Ansible Playbook.
+
+| Komponen             | Tools                         | Status |
+| -------------------- | ----------------------------- | ------ |
+| Container Runtime    | Docker + Compose Plugin       | ✅     |
+| Reverse Proxy        | Nginx Proxy Manager           | ✅     |
+| Container Management | Portainer CE                  | ✅     |
+| Metrics Collection   | Prometheus                    | ✅     |
+| Host Metrics Agent   | Node Exporter                 | ✅     |
+| Visualization        | Grafana (Dashboard ID: 1860)  | ✅     |
+| Automation           | Ansible Playbook (Idempotent) | ✅     |
+
+---
+
+## Bukti Visual
+
+### Grafana Dashboard — Four Golden Signals
+
+![Grafana Dashboard](screenshots/checkpoint-01/grafana-dashboard.png)
+
+### Prometheus Targets — Semua Status UP
+
+![Prometheus Targets](screenshots/checkpoint-01/prometheus-targets.png)
+
+### Portainer — Running Containers
+
+![Portainer](screenshots/checkpoint-01/portainer-containers.png)
+
+---
+
+## Keputusan Teknis yang Dibuat
+
+### 1. Modul `community.docker.docker_container` vs `command: docker run`
+
+Awalnya menggunakan `command: docker run` di playbook — ini **anti-pattern** karena:
+
+- Error kalau container sudah ada ("name already in use")
+- Tidak idempotent — tidak bisa dijalankan ulang dengan aman
+
+Solusi: beralih ke `community.docker.docker_container`. Ansible sekarang "mewawancarai" Docker Engine via API — kalau config sama, skip. Kalau berbeda, update otomatis.
+
+### 2. Semua Port Admin di-bind ke `127.0.0.1`
+
+Port Portainer (:9000), Grafana (:3000), dan NPM Admin (:81) tidak diekspos ke publik. Akses hanya via SSH tunnel. Ini mencegah brute-force attack dari bot otomatis.
+
+### 3. Internal DNS sebagai Backbone Komunikasi Container
+
+Grafana mengakses Prometheus via `http://prometheus:9090` — bukan via IP. Ketika container di-recreate, tidak perlu update konfigurasi apapun karena Docker internal DNS otomatis resolve nama container ke IP baru.
+
+---
+
+## Konsep yang Dipahami
+
+**Idempotency**  
+Jalankan playbook 1x atau 100x — hasilnya sama. Tidak ada error di run ke-2. Ini bukan fitur eksklusif Ansible, tapi mindset yang harus ada di semua script provisioning.
+
+**Ansible Handlers**  
+Kecerdasan sebab-akibat: kalau `prometheus.yml` berubah, handler otomatis restart container Prometheus di akhir play. Kalau tidak berubah, restart tidak dieksekusi. Efisien dan predictable.
+
+**Docker Immutability**  
+Container yang sudah menyala tidak bisa diubah konfigurasinya dari dalam. Kalau konfigurasi volume berubah, harus destroy container lama dan buat baru. Ini bukan bug — ini desain yang intentional.
+
+**Prometheus Pull Mechanism**  
+Prometheus tidak menunggu data dikirim (push). Ia aktif "menyedot" metrics dari endpoint `/metrics` milik Node Exporter sesuai interval yang dikonfigurasi di `prometheus.yml`.
+
+**Zero-Trust Networking**  
+Tidak ada service admin yang boleh dipercaya untuk diekspos ke internet, sekalipun sudah ada password. Attack surface yang tidak ada tidak bisa diserang.
+
+---
+
+## Yang Masih Perlu Diperbaiki
+
+- [x] **Ansible Vault** — secrets di playbook sudah dienkripsi menggunakan Vault
+- [ ] **Semantic versioning** — belum ada `git tag` untuk milestone ini
+- [ ] **Alerting** — Prometheus sudah collect metrics tapi belum ada alert kalau server down
+
+---
+
+## Lesson Learned
+
+Yang paling unexpected dari Fase 1 ini:
+
+> Ansible bukan tentang "otomasi command". Ansible tentang **mendeklarasikan state yang diinginkan** — lalu membiarkan Ansible yang cari tahu cara mencapainya, apapun kondisi server saat ini.
+
+Perbedaan mindset ini yang membedakan script provisioning biasa dari Infrastructure as Code yang sesungguhnya.
+
+---
+
+_Next: Fase 2 — Terraform DO Sandbox & integrasi cross-cloud monitoring._

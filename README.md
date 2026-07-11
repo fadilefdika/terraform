@@ -1,91 +1,179 @@
-# 🚀 Scalable Cloud Infrastructure with Terraform & DigitalOcean
+# 🛡️ Tencent Hub — Automated Monitoring Stack
 
-![Terraform](https://img.shields.io/badge/terraform-%235835CC.svg?style=for-the-badge&logo=terraform&logoColor=white)
-![DigitalOcean](https://img.shields.io/badge/DigitalOcean-%230180FF.svg?style=for-the-badge&logo=digitalOcean&logoColor=white)
+![Ansible](https://img.shields.io/badge/ansible-%231A1918.svg?style=for-the-badge&logo=ansible&logoColor=white)
 ![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)
-![Nginx](https://img.shields.io/badge/nginx-%23009639.svg?style=for-the-badge&logo=nginx&logoColor=white)
-![Security](https://img.shields.io/badge/Security-Strict-success?style=for-the-badge)
+![Prometheus](https://img.shields.io/badge/Prometheus-E6522C?style=for-the-badge&logo=Prometheus&logoColor=white)
+![Grafana](https://img.shields.io/badge/grafana-%23F46800.svg?style=for-the-badge&logo=grafana&logoColor=white)
+![Security](https://img.shields.io/badge/Security-Zero--Trust-success?style=for-the-badge)
 
 ## 📌 Project Overview
-This repository showcases an enterprise-grade **Infrastructure as Code (IaC)** deployment using **Terraform** on **DigitalOcean**. It is designed with modularity, scalability, and strict security practices at its core. 
 
-Instead of a traditional monolithic script, this project implements a highly scalable **Modular Architecture** separating environments (e.g., `dev`, `prod`) from reusable infrastructure blueprints (modules).
+Repository ini berisi Ansible Playbook untuk provisioning otomatis **Tencent Cloud Hub** — server gateway 24/7 yang berfungsi sebagai pusat monitoring dan reverse proxy dalam arsitektur hybrid cloud (Tencent + DigitalOcean).
+
+Seluruh stack dikonfigurasi menggunakan **Infrastructure as Code** dengan prinsip **idempotency** — playbook bisa dijalankan berkali-kali tanpa error atau perubahan yang tidak diinginkan.
+
+---
 
 ## ✨ Key Technical Achievements
 
-- **Modular Architecture**: Built a reusable `vps` module, enabling instantaneous provisioning of identical environments (`dev`, `staging`, `prod`) while adhering to the DRY (Don't Repeat Yourself) principle.
-- **Automated Provisioning (Cloud-Init)**: Utilized Bash scripting injected via `user_data` to automatically install Docker, Portainer, and Nginx Proxy Manager on boot without human intervention.
-- **Resilient Container Networking**: Implemented a custom Docker bridge network (`proxy-network`) enabling automatic Internal DNS resolution, ensuring seamless reverse proxying regardless of dynamic IP assignments.
-- **Zero-Trust Security & Hardening**:
-  - Direct public access to administrative dashboards (Portainer & NPM Admin) is **blocked**.
-  - Internal admin services are bound strictly to `127.0.0.1`.
-  - Secure access is facilitated exclusively via **SSH Tunneling**.
-  - Strict Firewall configurations allowing only port `22`, `80`, and `443` inbound.
-- **Secret Management**: API tokens and SSH keys are explicitly excluded from version control via `.gitignore` and handled dynamically through `.tfvars` to prevent credentials leakage.
+- **Full Idempotency**: Menggunakan modul resmi `community.docker.docker_container` — bukan `command: docker run`. Jalankan 1x atau 100x, hasilnya selalu sama.
+- **Zero-Trust Security**: Semua dashboard admin (Portainer, Grafana, NPM) di-bind ke `127.0.0.1`. Tidak ada port admin yang terbuka ke internet publik.
+- **Ansible Handlers**: Perubahan pada `prometheus.yml` otomatis men-trigger restart container — tanpa restart manual.
+- **Internal DNS**: Semua container berkomunikasi via nama (`http://prometheus:9090`), bukan IP — resilient terhadap container recreation.
+- **Secret Management**: Credentials tidak pernah hardcoded di playbook. Dikelola via Ansible Vault atau environment variable.
 
 ---
 
-## 🏗️ Architecture Visualization
+## 🏗️ Architecture
 
-[![Project Architecture](https://app.eraser.io/workspace/wkt4PvQbUT8Yd0HsOsSm/preview?elements=8Yh63-Fw-8WcK-a2x3U8qQ&type=embed)](https://app.eraser.io/workspace/wkt4PvQbUT8Yd0HsOsSm?origin=share)
+```
+Internet (Public)
+      │
+      ▼
+[ Cloud Firewall ]
+  Port 22, 80, 443 only
+      │
+      ▼
+[ Tencent VPS — Ubuntu 22.04 ]
+  2 vCPU / 2GB RAM / Always-ON
+      │
+      ▼
+[ Docker Engine ]
+      │
+      └── proxy-network (Docker Bridge)
+            ├── Nginx Proxy Manager  → :80, :443 (PUBLIC)
+            ├── Portainer CE         → :9000 (localhost only)
+            ├── Prometheus           → :9090 (localhost only)
+            ├── Grafana              → :3000 (localhost only)
+            └── Node Exporter        → :9100 (internal only)
+```
 
-> **Note:** Click the image above to view the interactive diagram and source code on Eraser.io.
+> Akses admin hanya via SSH Tunnel — lihat bagian [Accessing Dashboards](#-accessing-dashboards).
 
 ---
 
-## 📂 Scalable Directory Structure
+## 📂 Repository Structure
 
-```text
-.
-├── environments/
-│   └── dev/                  # Development Environment
-│       ├── main.tf           # Calls the 'vps' module
-│       ├── variables.tf      # Env-specific variables
-│       ├── outputs.tf        
-│       ├── providers.tf      # DigitalOcean Provider Config
-│       └── terraform.tfvars  # [IGNORED] Secrets & Keys
-├── modules/
-│   └── vps/                  # Reusable Blueprint Module
-│       ├── main.tf           # Droplet & Firewall Resources
-│       ├── variables.tf
-│       ├── outputs.tf
-│       └── scripts/
-│           └── init.sh       # Bootstrap script (Docker, Portainer, NPM)
-├── AGENTS.md                 # DevOps & Security Guidelines
-└── README.md                 # Project Documentation
+```
+ansible/
+├── setup-hub.yml             # Main playbook (entry point)
+├── inventory.ini             # Target server definition
+├── secrets.yml               # File rahasia terenkripsi (Ansible Vault)
+docs/
+├── checkpoint-01-hub-monitoring.md # Refleksi & pembelajaran Fase 1
+├── decisions/
+│   └── ADR-001-why-tencent-as-hub.md
+.gitignore
+README.md
 ```
 
-## 🚀 How to Run (Development)
+---
 
-1. Navigate to the desired environment:
-   ```bash
-   cd environments/dev
-   ```
-2. Initialize Terraform (downloads providers & modules):
-   ```bash
-   terraform init
-   ```
-3. Preview the infrastructure plan:
-   ```bash
-   terraform plan -out=rencana.tfplan
-   ```
-4. Deploy to DigitalOcean:
-   ```bash
-   terraform apply "rencana.tfplan"
-   ```
+## 🚀 How to Run
 
-## 🔒 Accessing Admin Dashboards (Post-Deploy)
+### Prerequisites
 
-To access the administrative tools safely without exposing them to the internet, establish an SSH tunnel using the dynamically generated IPs outputted by Terraform.
-
-**Portainer (Container Management):**
 ```bash
-ssh -L 9000:127.0.0.1:9000 root@<DROPLET_IP>
-```
-*Access via browser at `http://localhost:9000`*
+# Install Ansible di local machine
+pip install ansible
 
-**Nginx Proxy Manager (Reverse Proxy Admin):**
-```bash
-ssh -L 81:127.0.0.1:81 root@<DROPLET_IP>
+# Install Docker collection
+ansible-galaxy collection install community.docker
 ```
-*Access via browser at `http://localhost:81`*
+
+### 1. Setup Inventory
+
+```ini
+# inventory.ini
+[hub]
+tencent-hub ansible_host=<IP_TENCENT> ansible_user=root
+```
+
+### 2. Jalankan Playbook
+
+```bash
+# Dry-run dulu (tidak ada perubahan nyata)
+ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory.ini setup-hub.yml --check --vault-password-file .vault_pass.txt
+
+# Apply
+ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i inventory.ini setup-hub.yml -k --vault-password-file .vault_pass.txt
+```
+
+### 3. Verifikasi
+
+```bash
+# Cek semua container berjalan
+ansible -i inventory.ini hub -m command -a "docker ps"
+```
+
+---
+
+## 🔒 Accessing Dashboards
+
+Semua dashboard admin **tidak bisa diakses langsung dari browser** karena di-bind ke `127.0.0.1`. Akses menggunakan SSH tunnel:
+
+**Portainer (Container Management) — Port 9000:**
+
+```bash
+ssh -L 9000:127.0.0.1:9000 root@<IP_TENCENT>
+```
+
+Buka: `http://localhost:9000`
+
+**Grafana (Monitoring Dashboard) — Port 3000:**
+
+```bash
+ssh -L 3000:127.0.0.1:3000 root@<IP_TENCENT>
+```
+
+Buka: `http://localhost:3000`
+
+**Nginx Proxy Manager Admin — Port 81:**
+
+```bash
+ssh -L 81:127.0.0.1:81 root@<IP_TENCENT>
+```
+
+Buka: `http://localhost:81`
+
+> **Tip:** Bisa forward semua sekaligus dalam satu command:
+>
+> ```bash
+> ssh -L 9000:127.0.0.1:9000 -L 3000:127.0.0.1:3000 -L 81:127.0.0.1:81 root@<IP_TENCENT>
+> ```
+
+---
+
+## 📊 Monitoring Stack
+
+| Service                 | Role                   | Port    | Access          |
+| ----------------------- | ---------------------- | ------- | --------------- |
+| **Nginx Proxy Manager** | Reverse proxy + SSL    | 80, 443 | Public          |
+| **Portainer CE**        | Docker management UI   | 9000    | SSH Tunnel only |
+| **Prometheus**          | Metrics scraper (Pull) | 9090    | SSH Tunnel only |
+| **Grafana**             | Metrics visualization  | 3000    | SSH Tunnel only |
+| **Node Exporter**       | Host metrics agent     | 9100    | Internal only   |
+
+---
+
+## 🗺️ Roadmap
+
+- [x] Fase 1 — Setup Hub: Docker, NPM, Portainer
+- [x] Fase 1 — Monitoring: Prometheus + Grafana + Node Exporter
+- [x] Fase 1 — Security: Zero-Trust, SSH Tunnel, Firewall, Ansible Vault
+- [ ] Fase 3 — Cross-cloud monitoring: scrape Node Exporter dari DO Sandbox
+- [ ] Fase 5 — Alerting: Prometheus AlertManager
+
+---
+
+## 📚 Documentation
+
+| Dokumen                                             | Deskripsi                                |
+| --------------------------------------------------- | ---------------------------------------- |
+| [Checkpoint 01](docs/checkpoint-01-hub-monitoring.md)              | Refleksi & rangkuman pembelajaran Fase 1 |
+| [ADR-001](docs/decisions/ADR-001-why-tencent-as-hub.md) | Keputusan: Kenapa Tencent sebagai Hub    |
+| [AGENTS.md](AGENTS.md)                           | Standar & guidelines project             |
+
+---
+
+_Part of **DevOps/SRE Lab** — 8-week hands-on infrastructure learning sprint._
