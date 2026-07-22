@@ -49,27 +49,32 @@
         state: started
         enabled: yes
 
-    # Catatan: Untuk Portainer & Nginx, di tahap pemula kita bisa pakai command biasa dulu
-    - name: 6. Buat Docker Network (proxy-network)
-      command: docker network create proxy-network
+    # Catatan: Di-refactor ke Micro-segmentation (3 Network Terpisah)
+    - name: 6. Buat Docker Networks Terisolasi
+      command: docker network create {{ item }}
+      loop:
+        - proxy-net
+        - monitoring-net
+        - management-net
       ignore_errors: yes # Abaikan jika network sudah pernah terbuat sebelumnya
 
-    - name: 7. Jalankan Portainer Container
+    - name: 7. Jalankan Portainer Container (Management Net)
       command: >
         docker run -d -p 127.0.0.1:{{ portainer_port }}:9000 --name portainer
-        --network proxy-network --restart=always
+        --network management-net --restart=always
         -v /var/run/docker.sock:/var/run/docker.sock
         -v portainer_data:/data portainer/portainer-ce:latest
       ignore_errors: yes
 
-    - name: 8a. Hapus Nginx Container lama (agar port bisa di-update)
+    - name: 8a. Hapus Nginx Container lama (agar config bisa di-update)
       command: docker rm -f nginx-proxy-manager
       ignore_errors: yes
 
-    - name: 8b. Jalankan Nginx Proxy Manager Container (Port {{ npm_port }})
+    - name: 8b. Jalankan Nginx Proxy Manager Container (Proxy Net + Hardened)
       command: >
         docker run -d -p 80:80 -p 443:443 -p 127.0.0.1:{{ npm_port }}:81
-        --name nginx-proxy-manager --network proxy-network --restart=always
+        --name nginx-proxy-manager --network proxy-net --restart=always
+        --security-opt="no-new-privileges:true" --cap-drop=NET_RAW
         -v npm_data:/data -v npm_letsencrypt:/etc/letsencrypt
         jc21/nginx-proxy-manager:latest
       ignore_errors: yes
@@ -91,36 +96,39 @@
                 - targets: ['node-exporter:9100']
       notify: Restart Prometheus
 
-    - name: 11. Jalankan Node Exporter (Modul Elegan)
+    - name: 11. Jalankan Node Exporter (Monitoring Net)
       community.docker.docker_container:
         name: node-exporter
         image: prom/node-exporter:latest
         state: started
         restart_policy: always
+        purge_networks: yes
         networks:
-          - name: proxy-network
+          - name: monitoring-net
 
-    - name: 12. Jalankan Prometheus (Modul Elegan)
+    - name: 12. Jalankan Prometheus (Monitoring Net)
       community.docker.docker_container:
         name: prometheus
         image: prom/prometheus:latest
         state: started
         restart_policy: always
+        purge_networks: yes
         networks:
-          - name: proxy-network
+          - name: monitoring-net
         published_ports:
           - '127.0.0.1:{{ prometheus_port }}:9090'
         volumes:
           - '{{ monitoring_dir }}/prometheus.yml:/etc/prometheus/prometheus.yml'
 
-    - name: 13. Jalankan Grafana (Modul Elegan)
+    - name: 13. Jalankan Grafana (Monitoring Net)
       community.docker.docker_container:
         name: grafana
         image: grafana/grafana:latest
         state: started
         restart_policy: always
+        purge_networks: yes
         networks:
-          - name: proxy-network
+          - name: monitoring-net
         published_ports:
           - '127.0.0.1:{{ grafana_port }}:3000'
         env:

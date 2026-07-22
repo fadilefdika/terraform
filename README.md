@@ -24,9 +24,12 @@ Seluruh stack dikonfigurasi menggunakan **Infrastructure as Code** dengan prinsi
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Architecture (Network Micro-segmentation)
 
-```
+> **[TODO: Masukkan link atau embed gambar diagram dari Eraser.io di sini]**
+
+**Network Topology Flow (Micro-segmentation):**
+```text
 Internet (Public)
       │
       ▼
@@ -38,15 +41,24 @@ Internet (Public)
   2 vCPU / 2GB RAM / Always-ON
       │
       ▼
-[ Docker Engine ]
+[ Docker Engine ] (Iptables Isolated)
       │
-      └── proxy-network (Docker Bridge)
-            ├── Nginx Proxy Manager  → :80, :443 (PUBLIC)
-            ├── Portainer CE         → :9000 (localhost only)
-            ├── Prometheus           → :9090 (localhost only)
-            ├── Grafana              → :3000 (localhost only)
-            └── Node Exporter        → :9100 (internal only)
+      ├── proxy-net (Zona Merah / DMZ)
+      │     └── Nginx Proxy Manager  → :80, :443 (PUBLIC)
+      │
+      ├── monitoring-net (Zona Hijau)
+      │     ├── Prometheus           → :9090 (localhost only)
+      │     ├── Grafana              → :3000 (localhost only)
+      │     └── Node Exporter        → :9100 (internal only)
+      │
+      └── management-net (Zona Biru)
+            └── Portainer CE         → :9000 (localhost only)
 ```
+
+Infrastruktur ini menerapkan **Micro-segmentation** untuk membatasi *lateral movement* jika terjadi peretasan:
+- **`proxy-net` (Zona Merah):** Area publik (DMZ) yang hanya berisi Nginx Proxy Manager.
+- **`monitoring-net` (Zona Hijau):** Terisolasi dari publik, berisi Prometheus, Grafana, dan Node Exporter.
+- **`management-net` (Zona Biru):** Terisolasi murni, khusus untuk Portainer.
 
 > Akses admin hanya via SSH Tunnel — lihat bagian [Accessing Dashboards](#-accessing-dashboards).
 
@@ -144,6 +156,14 @@ Buka: `http://localhost:81`
 
 ---
 
+## 🔐 Security & Reliability
+
+- **Secrets Management (Ansible Vault):** Seluruh kredensial (password Grafana, Portainer, dll) tidak pernah di-commit dalam bentuk *plain-text*. File `ansible/secrets.yml` dienkripsi secara penuh menggunakan Ansible Vault (termasuk praktik *Identity-Based Verification*).
+- **Container Hardening:** Nginx Proxy Manager dikonfigurasi dengan `--security-opt="no-new-privileges:true"` (mencegah eskalasi *privilege*) dan `--cap-drop=NET_RAW` (memblokir tools *network scanning* bawaan hacker seperti ping/nmap dari dalam container).
+- **Rollback Plan (Disaster Recovery):** Infrastruktur dibangun sepenuhnya via Ansible (IaC) dan terikat dengan Git. Jika terjadi kegagalan sistem paska-deploy (downtime), *rollback* dapat dilakukan secara deterministik dengan me-revert commit terakhir di Git dan menjalankan ulang perintah `ansible-playbook setup-hub.yml`.
+
+---
+
 ## 📊 Monitoring Stack
 
 | Service                 | Role                   | Port    | Access          |
@@ -172,6 +192,7 @@ Buka: `http://localhost:81`
 | --------------------------------------------------- | ---------------------------------------- |
 | [Checkpoint 01](docs/checkpoint-01-hub-monitoring.md)              | Refleksi & rangkuman pembelajaran Fase 1 |
 | [ADR-001](docs/decisions/ADR-001-why-tencent-as-hub.md) | Keputusan: Kenapa Tencent sebagai Hub    |
+| [ADR-002](docs/decisions/ADR-002-network-microsegmentation.md) | Keputusan: Network Micro-segmentation & Hardening |
 | [AGENTS.md](AGENTS.md)                           | Standar & guidelines project             |
 
 ---
