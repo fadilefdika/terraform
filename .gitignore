@@ -31,3 +31,7 @@ planning.md
 # Ansible Vault
 .vault_pass.txt
 ansible/secrets.yml
+
+# Dokumentasi Internal Belajar
+latihan.md
+rancangan.md
