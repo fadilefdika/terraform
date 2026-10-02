@@ -1,6 +1,6 @@
 ---
 - name: Setup Tencent Hub (Docker, Nginx, Portainer)
-  hosts: all
+  hosts: "{{ target | default('staging') }}"
   become: yes # Bertindak sebagai root (sudo)
 
   vars_files:
@@ -19,11 +19,18 @@
         name: Asia/Jakarta
 
     - name: 1.2 Matikan Fitur Login Password SSH (Security Hardening)
-      lineinfile:
-        path: /etc/ssh/sshd_config
-        regexp: '^#?PasswordAuthentication'
-        line: 'PasswordAuthentication no'
+      copy:
+        dest: /etc/ssh/sshd_config.d/01-hardening.conf # 01 supaya dibaca lebih dulu
+        content: |
+          PasswordAuthentication no
+          PermitRootLogin no
+        mode: "0644"
+        validate: sshd -t -f %s # cek sintaks sebelum diterapkan
       notify: Restart SSH
+
+    - name: 1.25 Bersihkan repo Docker lama yang menyebabkan konflik APT
+      shell: rm -f /etc/apt/sources.list.d/*docker* /etc/apt/sources.list.d/archive_uri-https_download_docker_com*
+      ignore_errors: yes
 
     - name: 1.3 Update apt cache & Install dependencies dan alat bantu
       apt:
@@ -37,15 +44,39 @@
           - ufw
         state: present
         update_cache: yes
+    - name: 1.4 UFW izinkan SSH, HTTP, HTTPS
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop: ["22", "80", "443"]
 
-    - name: 2. Tambahkan GPG Key resmi Docker
-      apt_key:
+    - name: 1.5 Aktifkan UFW
+      community.general.ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+    - name: 2. Buat folder keyrings apt
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: 2.5 Unduh GPG key Docker
+      get_url:
         url: https://download.docker.com/linux/ubuntu/gpg
-        state: present
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
 
-    - name: 3. Tambahkan Repositori Docker
+    - name: Hapus repo Docker lama (tanpa signed-by)
+      file:
+        path: /etc/apt/sources.list.d/download_docker_com_linux_ubuntu.list
+        state: absent
+
+    - name: 3. Tambah repo Docker (Modern)
       apt_repository:
-        repo: deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        filename: docker
         state: present
 
     - name: 4. Install Docker dan kawan-kawannya
@@ -66,12 +97,12 @@
 
     # Catatan: Di-refactor ke Micro-segmentation (3 Network Terpisah)
     - name: 6. Buat Docker Networks Terisolasi
-      command: docker network create {{ item }}
+      community.docker.docker_network:
+        name: "{{ item }}"
       loop:
         - proxy-net
         - monitoring-net
         - management-net
-      ignore_errors: yes # Abaikan jika network sudah pernah terbuat sebelumnya
 
     - name: 7. Jalankan Portainer
       community.docker.docker_container:
@@ -201,7 +232,7 @@
     - name: 13. Jalankan Grafana (Monitoring Net)
       community.docker.docker_container:
         name: grafana
-        image: grafana/grafana:latest
+        image: grafana/grafana:11.1.0
         state: started
         restart_policy: always
         purge_networks: yes
@@ -222,6 +253,7 @@
         volumes:
           - grafana_data:/var/lib/grafana
           - "{{ monitoring_dir }}/grafana/provisioning:/etc/grafana/provisioning"
+      no_log: true
 
   handlers:
     - name: Restart Prometheus
