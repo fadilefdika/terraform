@@ -1,39 +1,157 @@
 ---
-- name: Setup Tencent Hub (Docker, Nginx, Portainer)
-  hosts: "{{ target | default('staging') }}"
-  become: yes # Bertindak sebagai root (sudo)
+# =====================================================================
+# Tencent Hub (versi ramping)
+# Hardening dasar -> Docker -> Proxy/Portainer -> Monitoring -> Backup
+#
+#   ansible-playbook -i inventory.ini tencent-hub-lean.yml -e target=production --ask-vault-pass
+#
+# Collection (sekali, di control node):
+#   ansible-galaxy collection install community.general community.docker ansible.posix
+# =====================================================================
+- name: Setup Tencent Hub
+  hosts: "{{ target | default('production') }}"
+  become: true
 
   vars_files:
-    - secrets.yml # File rahasia yang dienkripsi Ansible Vault
+    - secrets.yml # dienkripsi Ansible Vault
 
   vars:
+    ssh_port: 22
+    ssh_service: "{{ 'ssh' if ansible_os_family == 'Debian' else 'sshd' }}"
+    admin_key_path: "{{ (ansible_ssh_private_key_file | default('~/.ssh/id_rsa')) | expanduser }}"
+
+    docker_distro: "{{ ansible_distribution | lower }}"
+    docker_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
     portainer_port: 9000
     npm_port: 8181
     prometheus_port: 9090
     grafana_port: 3000
     monitoring_dir: /opt/monitoring
 
+    # TODO: ganti 'latest' dengan tag versi tetap setelah dicek di Docker Hub
+    portainer_image: portainer/portainer-ce:latest
+    npm_image: jc21/nginx-proxy-manager:latest
+    node_exporter_image: prom/node-exporter:latest
+    prometheus_image: prom/prometheus:latest
+    alertmanager_image: prom/alertmanager:v0.27.0
+    grafana_image: grafana/grafana:11.1.0
+
+    # --- Backup (restic -> storage S3-compatible gratis, misal Cloudflare R2 atau Backblaze B2) ---
+    restic_s3_region: auto # R2: auto. B2: isi region, mis. us-west-004
+    backup_hour: 3
+    backup_minute: 15
+    backup_healthcheck_url: "" # opsional: URL ping dari healthchecks.io
+    backup_paths:
+      - /var/lib/docker/volumes/npm_data/_data
+      - /var/lib/docker/volumes/npm_letsencrypt/_data
+      - /var/lib/docker/volumes/grafana_data/_data
+      - /var/lib/docker/volumes/portainer_data/_data
+
+    required_secrets:
+      - telegram_bot_token
+      - telegram_chat_id
+      - grafana_admin_password
+      - grafana_smtp_user
+      - grafana_smtp_app_password
+      - restic_repository
+      - restic_password
+      - restic_access_key_id
+      - restic_secret_access_key
+
   tasks:
-    - name: 1.1 Atur Zona Waktu (Timezone) ke Asia/Jakarta
-      timezone:
+    # ------------------------------------------------------------------
+    # 0. PENGECEKAN AWAL
+    # ------------------------------------------------------------------
+    - name: 0.1 Pastikan login bukan sebagai root
+      ansible.builtin.assert:
+        that: ansible_user is defined and ansible_user != 'root'
+        fail_msg: "ansible_user harus user non-root ber-sudo (root akan dimatikan di SSH)."
+        quiet: true
+
+    - name: 0.2 Pastikan semua secret ada di secrets.yml
+      ansible.builtin.assert:
+        that: lookup('vars', item, default='') | string | length > 0
+        fail_msg: "Variabel '{{ item }}' belum ada di secrets.yml"
+        quiet: true
+      loop: "{{ required_secrets }}"
+
+    # ------------------------------------------------------------------
+    # 1. SERVER & KEAMANAN
+    # ------------------------------------------------------------------
+    - name: 1.1 Atur zona waktu ke Asia/Jakarta
+      community.general.timezone:
         name: Asia/Jakarta
 
-    - name: 1.2 Matikan Fitur Login Password SSH (Security Hardening)
-      copy:
-        dest: /etc/ssh/sshd_config.d/01-hardening.conf # 01 supaya dibaca lebih dulu
+    - name: 1.2 Pasang kunci publik admin
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        key: "{{ lookup('file', admin_key_path + '.pub') }}"
+        state: present
+
+    - name: 1.3 Tes login SSH hanya dengan kunci (jaring pengaman anti-lockout)
+      ansible.builtin.command: >
+        ssh -o BatchMode=yes
+            -o PasswordAuthentication=no
+            -o PreferredAuthentications=publickey
+            -o StrictHostKeyChecking=accept-new
+            -o ConnectTimeout=10
+            -p {{ hostvars[inventory_hostname].ansible_port | default(ssh_port) }}
+            -i {{ admin_key_path }}
+            {{ hostvars[inventory_hostname].ansible_user | default(ansible_user) }}@{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }} true
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: 1.4 Hardening SSH (drop-in, dibaca lebih dulu dari file cloud-init)
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/01-hardening.conf
         content: |
           PasswordAuthentication no
+          KbdInteractiveAuthentication no
           PermitRootLogin no
+          MaxAuthTries 3
+        owner: root
+        group: root
         mode: "0644"
-        validate: sshd -t -f %s # cek sintaks sebelum diterapkan
-      notify: Restart SSH
+        validate: sshd -t -f %s
+      notify: Reload SSH
 
-    - name: 1.25 Bersihkan repo Docker lama yang menyebabkan konflik APT
-      shell: rm -f /etc/apt/sources.list.d/*docker* /etc/apt/sources.list.d/archive_uri-https_download_docker_com*
-      ignore_errors: yes
+    - name: 1.5 Baca konfigurasi SSH yang benar-benar berlaku (sekaligus menguji sintaks)
+      ansible.builtin.command: sshd -T
+      register: sshd_effective
+      changed_when: false
+      when: not ansible_check_mode
 
-    - name: 1.3 Update apt cache & Install dependencies dan alat bantu
-      apt:
+    - name: 1.6 Pastikan hardening benar-benar aktif
+      ansible.builtin.assert:
+        that:
+          - "'passwordauthentication no' in sshd_effective.stdout"
+          - "'permitrootlogin no' in sshd_effective.stdout"
+        fail_msg: "Drop-in tidak terbaca sshd (Ubuntu 20.04 tidak punya Include di sshd_config)."
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: 1.7 Terapkan reload SSH sekarang, bukan di akhir play
+      ansible.builtin.meta: flush_handlers
+
+    - name: 1.8 Cari repo Docker lama (selain docker.list milik kita)
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: "*docker*"
+        excludes: ["docker.list"]
+      register: old_docker_repos
+
+    - name: 1.9 Hapus repo Docker lama yang bikin konflik APT
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_docker_repos.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: 1.10 Install alat bantu, firewall, patch otomatis, dan restic
+      ansible.builtin.apt:
         name:
           - ca-certificates
           - curl
@@ -42,61 +160,124 @@
           - git
           - vim
           - ufw
+          - unattended-upgrades
+          - restic
         state: present
-        update_cache: yes
-    - name: 1.4 UFW izinkan SSH, HTTP, HTTPS
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: 1.11 Aktifkan patch keamanan otomatis (tanpa auto-reboot)
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: 1.12a Buat folder drop-in untuk journald
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: 1.12 Batasi ukuran log sistem (journald) agar disk tidak penuh
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/size.conf
+        content: |
+          [Journal]
+          SystemMaxUse=500M
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart journald
+
+    - name: 1.13 UFW - tolak semua yang masuk secara default
+      community.general.ufw:
+        default: deny
+        direction: incoming
+
+    - name: 1.14 UFW - SSH dengan rate limiting
+      community.general.ufw:
+        rule: limit
+        port: "{{ ssh_port }}"
+        proto: tcp
+
+    - name: 1.15 UFW - izinkan HTTP dan HTTPS
       community.general.ufw:
         rule: allow
         port: "{{ item }}"
         proto: tcp
-      loop: ["22", "80", "443"]
+      loop: ["80", "443"]
 
-    - name: 1.5 Aktifkan UFW
+    - name: 1.16 Aktifkan UFW (rule SSH sudah ada sebelum enable)
       community.general.ufw:
         state: enabled
-        policy: deny
-        direction: incoming
-    - name: 2. Buat folder keyrings apt
-      file:
+
+    # ------------------------------------------------------------------
+    # 2. DOCKER
+    # ------------------------------------------------------------------
+    - name: 2.1 Buat folder keyrings apt
+      ansible.builtin.file:
         path: /etc/apt/keyrings
         state: directory
         mode: "0755"
 
-    - name: 2.5 Unduh GPG key Docker
-      get_url:
-        url: https://download.docker.com/linux/ubuntu/gpg
+    - name: 2.2 Unduh GPG key resmi Docker
+      ansible.builtin.get_url:
+        url: "https://download.docker.com/linux/{{ docker_distro }}/gpg"
         dest: /etc/apt/keyrings/docker.asc
         mode: "0644"
 
-    - name: Hapus repo Docker lama (tanpa signed-by)
-      file:
-        path: /etc/apt/sources.list.d/download_docker_com_linux_ubuntu.list
-        state: absent
-
-    - name: 3. Tambah repo Docker (Modern)
-      apt_repository:
-        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    - name: 2.3 Tambah repo Docker resmi (signed-by)
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [arch={{ docker_arch }} signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/{{ docker_distro }}
+          {{ ansible_distribution_release }} stable
         filename: docker
         state: present
 
-    - name: 4. Install Docker dan kawan-kawannya
-      apt:
+    - name: 2.4 Install Docker dan plugin Compose
+      ansible.builtin.apt:
         name:
           - docker-ce
           - docker-ce-cli
           - containerd.io
           - docker-compose-plugin
-          - python3-docker # Syarat wajib untuk memakai modul Ansible Docker
+          - python3-docker # dibutuhkan modul community.docker.*
         state: present
 
-    - name: 5. Pastikan Docker otomatis menyala saat server restart
-      systemd:
+    - name: 2.5 Rotasi log container dan live-restore
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "10m", "max-file": "3" },
+            "live-restore": true
+          }
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart Docker
+
+    - name: 2.6 Terapkan konfigurasi Docker SEBELUM container pertama dibuat
+      ansible.builtin.meta: flush_handlers
+
+    - name: 2.7 Pastikan Docker menyala otomatis saat server restart
+      ansible.builtin.systemd:
         name: docker
         state: started
-        enabled: yes
+        enabled: true
 
-    # Catatan: Di-refactor ke Micro-segmentation (3 Network Terpisah)
-    - name: 6. Buat Docker Networks Terisolasi
+    # ------------------------------------------------------------------
+    # 3. JARINGAN, PROXY, PORTAINER
+    # ------------------------------------------------------------------
+    - name: 3.1 Buat tiga network terpisah
       community.docker.docker_network:
         name: "{{ item }}"
       loop:
@@ -104,28 +285,28 @@
         - monitoring-net
         - management-net
 
-    - name: 7. Jalankan Portainer
+    - name: 3.2 Jalankan Portainer (localhost saja)
       community.docker.docker_container:
         name: portainer
-        image: portainer/portainer-ce:latest
+        image: "{{ portainer_image }}"
         state: started
-        restart_policy: always
-        purge_networks: yes
+        restart_policy: unless-stopped
+        purge_networks: true
         networks:
           - name: management-net
         published_ports:
-          - "127.0.0.1:{{portainer_port}}:9000"
+          - "127.0.0.1:{{ portainer_port }}:9000"
         volumes:
           - portainer_data:/data
           - /var/run/docker.sock:/var/run/docker.sock
 
-    - name: 8. Jalankan Nginx Proxy Manager Container
+    - name: 3.3 Jalankan Nginx Proxy Manager (satu-satunya yang publik di 80/443)
       community.docker.docker_container:
         name: nginx-proxy-manager
-        image: jc21/nginx-proxy-manager:latest
+        image: "{{ npm_image }}"
         state: started
-        restart_policy: always
-        purge_networks: yes
+        restart_policy: unless-stopped
+        purge_networks: true
         security_opts:
           - "no-new-privileges:true"
         cap_drop:
@@ -140,33 +321,49 @@
           - npm_data:/data
           - npm_letsencrypt:/etc/letsencrypt
 
-    - name: 9. Buat Folder Monitoring
-      file:
+    # ------------------------------------------------------------------
+    # 4. MONITORING
+    # ------------------------------------------------------------------
+    - name: 4.1 Buat folder monitoring
+      ansible.builtin.file:
         path: "{{ item }}"
         state: directory
+        mode: "0755"
       loop:
         - "{{ monitoring_dir }}"
         - "{{ monitoring_dir }}/grafana/provisioning/datasources"
 
-    - name: 10. Injeksi file konfigurasi prometheus.yml
-      copy:
+    - name: 4.2 Tulis prometheus.yml
+      ansible.builtin.copy:
         dest: "{{ monitoring_dir }}/prometheus.yml"
+        mode: "0644"
         content: |
           global:
             scrape_interval: 30s
             evaluation_interval: 30s
+          rule_files:
+            - /etc/prometheus/alert-rules.yml
+          alerting:
+            alertmanagers:
+              - api_version: v2
+                static_configs:
+                  - targets: ["alertmanager:9093"]
           scrape_configs:
             - job_name: node
               static_configs:
                 - targets: ["node-exporter:9100"]
-            - job_name: cadvisor
+            - job_name: prometheus
               static_configs:
-                - targets: ["cadvisor:8080"]
+                - targets: ["localhost:9090"]
+            - job_name: alertmanager
+              static_configs:
+                - targets: ["alertmanager:9093"]
       notify: Restart Prometheus
 
-    - name: 10.5 Injeksi file Grafana Datasource
-      copy:
+    - name: 4.3 Tulis datasource Grafana
+      ansible.builtin.copy:
         dest: "{{ monitoring_dir }}/grafana/provisioning/datasources/prometheus.yml"
+        mode: "0644"
         content: |
           apiVersion: 1
           datasources:
@@ -175,14 +372,123 @@
               access: proxy
               url: http://prometheus:9090
               isDefault: true
+      notify: Restart Grafana
 
-    - name: 11. Jalankan Node Exporter (Monitoring Net)
+    - name: 4.4 Tulis alert rules Prometheus
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/alert-rules.yml"
+        mode: "0644"
+        content: |
+          {% raw %}
+          groups:
+            - name: host
+              rules:
+                - alert: TargetDown
+                  expr: up == 0
+                  for: 1m
+                  labels: { severity: critical }
+                  annotations:
+                    summary: "Target {{ $labels.job }} tidak merespons"
+                    description: "Prometheus gagal scrape {{ $labels.instance }} selama lebih dari 1 menit. Exporter atau servernya kemungkinan bermasalah."
+                    action: "Cek status container exporter, lalu pastikan servernya masih hidup."
+
+                - alert: OOMKillDetected
+                  expr: increase(node_vmstat_oom_kill[5m]) > 0
+                  labels: { severity: critical }
+                  annotations:
+                    summary: "Kernel mematikan proses karena RAM habis"
+                    description: 'Terjadi {{ $value | printf "%.0f" }} kejadian OOM kill dalam 5 menit terakhir.'
+                    action: "Jalankan dmesg -T | grep -i oom untuk melihat proses korbannya."
+
+                - alert: MemoryLow
+                  expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.15
+                  for: 5m
+                  labels: { severity: warning }
+                  annotations:
+                    summary: "RAM hampir habis, tersisa {{ $value | humanizePercentage }}"
+                    description: "Sisa RAM di bawah 15% selama lebih dari 5 menit. Server berisiko OOM kill."
+                    action: "Cek pemakaian per container dengan docker stats, restart service yang boros."
+
+                - alert: MemoryPressure
+                  expr: rate(node_pressure_memory_waiting_seconds_total[5m]) > 0.1
+                  for: 5m
+                  labels: { severity: warning }
+                  annotations:
+                    summary: "Proses antre menunggu memori"
+                    description: "Tekanan memori (PSI) tinggi selama lebih dari 5 menit. Aplikasi mulai melambat karena rebutan RAM."
+                    action: "Cek docker stats, pertimbangkan menurunkan limit memori atau menambah RAM."
+
+                - alert: SwapHigh
+                  expr: 1 - node_memory_SwapFree_bytes / node_memory_SwapTotal_bytes > 0.5
+                  for: 10m
+                  labels: { severity: warning }
+                  annotations:
+                    summary: "Swap terpakai {{ $value | humanizePercentage }}"
+                    description: "Swap di atas 50% selama lebih dari 10 menit. RAM fisik kemungkinan tidak cukup sehingga server melambat."
+                    action: "Cari proses yang memakai swap dan evaluasi kebutuhan RAM."
+
+                - alert: DiskLow
+                  expr: node_filesystem_avail_bytes{mountpoint="/",fstype!="tmpfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!="tmpfs"} < 0.15
+                  for: 10m
+                  labels: { severity: warning }
+                  annotations:
+                    summary: "Disk hampir penuh, tersisa {{ $value | humanizePercentage }}"
+                    description: "Sisa ruang di root disk (/) di bawah 15% selama lebih dari 10 menit."
+                    action: "Cek dengan du -sh /var/* dan docker system df, lalu bersihkan yang tidak perlu."
+
+                - alert: CpuHigh
+                  expr: 1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) > 0.85
+                  for: 10m
+                  labels: { severity: warning }
+                  annotations:
+                    summary: "CPU tinggi, rata-rata {{ $value | humanizePercentage }}"
+                    description: "Pemakaian CPU di atas 85% selama lebih dari 10 menit."
+                    action: "Cek proses penyebabnya dengan top atau docker stats."
+          {% endraw %}
+      notify: Restart Prometheus
+
+    - name: 4.5 Tulis konfigurasi Alertmanager (berisi token, izin 0600)
+      ansible.builtin.copy:
+        dest: "{{ monitoring_dir }}/alertmanager.yml"
+        owner: "65534"
+        mode: "0600"
+        content: |
+          route:
+            receiver: telegram
+            group_by: [alertname]
+            group_wait: 10s
+            group_interval: 5m
+            repeat_interval: 4h
+          receivers:
+            - name: telegram
+              telegram_configs:
+                - bot_token: "{{ telegram_bot_token }}"
+                  chat_id: {{ telegram_chat_id | int }}
+                  send_resolved: true
+                  parse_mode: HTML
+                  message: |
+                    {% raw %}{{ range .Alerts -}}
+                    {{ if eq .Status "firing" -}}
+                    {{ if eq .Labels.severity "critical" }}🔴 <b>CRITICAL</b>{{ else }}🟠 <b>WARNING</b>{{ end }} · {{ .Labels.alertname }}
+                    <b>{{ .Annotations.summary }}</b>
+                    {{ .Annotations.description }}
+                    {{ if .Labels.instance }}🖥 <code>{{ .Labels.instance }}</code>
+                    {{ end }}💡 <i>{{ .Annotations.action }}</i>
+                    {{ else -}}
+                    ✅ <b>RESOLVED</b> · {{ .Labels.alertname }}
+                    Kondisi sudah kembali normal.
+                    {{ end }}
+                    {{ end }}{% endraw %}
+      no_log: true
+      notify: Restart Alertmanager
+
+    - name: 4.6 Jalankan Node Exporter
       community.docker.docker_container:
         name: node-exporter
-        image: prom/node-exporter:latest
+        image: "{{ node_exporter_image }}"
         state: started
-        restart_policy: always
-        purge_networks: yes
+        restart_policy: unless-stopped
+        purge_networks: true
         command:
           - --path.rootfs=/host
         volumes:
@@ -190,32 +496,18 @@
         networks:
           - name: monitoring-net
 
-    - name: 11.5 Jalankan cAdvisor (Monitoring Net)
+    - name: 4.7 Pastikan cAdvisor (sisa konfigurasi lama) sudah dihapus
       community.docker.docker_container:
         name: cadvisor
-        image: gcr.io/cadvisor/cadvisor:v0.49.1
-        state: started
-        restart_policy: always
-        purge_networks: yes
-        memory: 128m
-        command:
-          - --docker_only=true
-          - --housekeeping_interval=30s
-        volumes:
-          - "/:/rootfs:ro"
-          - "/var/run:/var/run:ro"
-          - "/sys:/sys:ro"
-          - "/var/lib/docker/:/var/lib/docker:ro"
-        networks:
-          - name: monitoring-net
+        state: absent
 
-    - name: 12. Jalankan Prometheus (Monitoring Net)
+    - name: 4.8 Jalankan Prometheus
       community.docker.docker_container:
         name: prometheus
-        image: prom/prometheus:latest
+        image: "{{ prometheus_image }}"
         state: started
-        restart_policy: always
-        purge_networks: yes
+        restart_policy: unless-stopped
+        purge_networks: true
         memory: 256m
         command:
           - --config.file=/etc/prometheus/prometheus.yml
@@ -227,27 +519,46 @@
           - "127.0.0.1:{{ prometheus_port }}:9090"
         volumes:
           - "{{ monitoring_dir }}/prometheus.yml:/etc/prometheus/prometheus.yml"
+          - "{{ monitoring_dir }}/alert-rules.yml:/etc/prometheus/alert-rules.yml"
           - prometheus_data:/prometheus
 
-    - name: 13. Jalankan Grafana (Monitoring Net)
+    - name: 4.9 Jalankan Alertmanager
+      community.docker.docker_container:
+        name: alertmanager
+        image: "{{ alertmanager_image }}"
+        state: started
+        restart_policy: unless-stopped
+        purge_networks: true
+        memory: 128m
+        networks:
+          - name: monitoring-net
+        published_ports:
+          - "127.0.0.1:9093:9093"
+        volumes:
+          - "{{ monitoring_dir }}/alertmanager.yml:/etc/alertmanager/alertmanager.yml"
+          - alertmanager_data:/alertmanager
+
+    - name: 4.10 Jalankan Grafana (ikut proxy-net agar bisa di-proxy lewat NPM)
       community.docker.docker_container:
         name: grafana
-        image: grafana/grafana:11.1.0
+        image: "{{ grafana_image }}"
         state: started
-        restart_policy: always
-        purge_networks: yes
+        restart_policy: unless-stopped
+        purge_networks: true
         memory: 256m
         networks:
           - name: monitoring-net
+          - name: proxy-net
         published_ports:
           - "127.0.0.1:{{ grafana_port }}:3000"
         env:
           GF_SECURITY_ADMIN_PASSWORD: "{{ grafana_admin_password }}"
+          GF_USERS_ALLOW_SIGN_UP: "false"
           GF_SMTP_ENABLED: "true"
           GF_SMTP_HOST: "smtp.gmail.com:587"
-          GF_SMTP_USER: "alamat@gmail.com"
+          GF_SMTP_USER: "{{ grafana_smtp_user }}"
           GF_SMTP_PASSWORD: "{{ grafana_smtp_app_password }}"
-          GF_SMTP_FROM_ADDRESS: "alamat@gmail.com"
+          GF_SMTP_FROM_ADDRESS: "{{ grafana_smtp_user }}"
           GF_SMTP_FROM_NAME: "VPS Grafana Alert"
           GF_SMTP_STARTTLS_POLICY: "MandatoryStartTLS"
         volumes:
@@ -255,14 +566,90 @@
           - "{{ monitoring_dir }}/grafana/provisioning:/etc/grafana/provisioning"
       no_log: true
 
+    # ------------------------------------------------------------------
+    # 5. BACKUP TERENKRIPSI KE STORAGE GRATIS (restic)
+    # ------------------------------------------------------------------
+    - name: 5.1 Simpan kredensial backup (hanya bisa dibaca root)
+      ansible.builtin.copy:
+        dest: /etc/restic.env
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          RESTIC_REPOSITORY={{ restic_repository | quote }}
+          RESTIC_PASSWORD={{ restic_password | quote }}
+          AWS_ACCESS_KEY_ID={{ restic_access_key_id | quote }}
+          AWS_SECRET_ACCESS_KEY={{ restic_secret_access_key | quote }}
+          AWS_DEFAULT_REGION={{ restic_s3_region | quote }}
+      no_log: true
+
+    - name: 5.2 Inisialisasi repository backup (hanya jika belum ada)
+      ansible.builtin.shell: |
+        set -a; . /etc/restic.env; set +a
+        if restic cat config >/dev/null 2>&1; then echo exists; else restic init; fi
+      args:
+        executable: /bin/bash
+      register: restic_init
+      changed_when: "'created restic repository' in restic_init.stdout"
+
+    - name: 5.3 Tulis skrip backup
+      ansible.builtin.copy:
+        dest: /usr/local/bin/backup.sh
+        owner: root
+        group: root
+        mode: "0750"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+          set -a; . /etc/restic.env; set +a
+
+          restic backup {{ backup_paths | join(' ') }}
+          restic forget --keep-daily 7 --keep-weekly 4 --keep-monthly 3 --prune
+          {% if backup_healthcheck_url | length > 0 %}
+
+          curl -fsS -m 10 --retry 3 {{ backup_healthcheck_url | quote }} >/dev/null
+          {% endif %}
+
+    - name: 5.4 Jadwalkan backup harian
+      ansible.builtin.cron:
+        name: backup harian restic
+        user: root
+        hour: "{{ backup_hour }}"
+        minute: "{{ backup_minute }}"
+        job: "/usr/local/bin/backup.sh 2>&1 | logger -t backup"
+
   handlers:
+    - name: Reload SSH
+      ansible.builtin.service:
+        name: "{{ ssh_service }}"
+        state: reloaded
+
+    - name: Restart journald
+      ansible.builtin.systemd:
+        name: systemd-journald
+        state: restarted
+
+    - name: Restart Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+
+    # Restart (bukan reload): copy mengganti file lewat rename, sehingga bind-mount
+    # satu file baru terbaca setelah container start ulang.
     - name: Restart Prometheus
       community.docker.docker_container:
         name: prometheus
         state: started
-        restart: yes
+        restart: true
 
-    - name: Restart SSH
-      service:
-        name: sshd
-        state: restarted
+    - name: Restart Alertmanager
+      community.docker.docker_container:
+        name: alertmanager
+        state: started
+        restart: true
+
+    - name: Restart Grafana
+      community.docker.docker_container:
+        name: grafana
+        state: started
+        restart: true
